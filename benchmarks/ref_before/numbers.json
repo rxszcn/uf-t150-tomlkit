@@ -1,0 +1,4 @@
+{
+ "dumps": "[n]\na = 1_000\nb = 0xDEAD_BEEF\nc = 0o755\nd = 0b1010\ne = 3.14\nf = 1e10\ng = -inf\nh = +nan\ni = inf\nj = nan\nk = +1.5\nl = -0.0\n",
+ "unwrapped": "{\"n\": {\"a\": 1000, \"b\": 3735928559, \"c\": 493, \"d\": 10, \"e\": 3.14, \"f\": 10000000000.0, \"g\": -Infinity, \"h\": NaN, \"i\": Infinity, \"j\": NaN, \"k\": 1.5, \"l\": -0.0}}"
+}

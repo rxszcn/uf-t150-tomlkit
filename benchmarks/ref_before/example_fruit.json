@@ -1,0 +1,4 @@
+{
+ "dumps": "[[fruit.blah]]\n  name = \"apple\"\n\n  [fruit.blah.physical]\n    color = \"red\"\n    shape = \"round\"\n\n[[fruit.blah]]\n  name = \"banana\"\n\n  [fruit.blah.physical]\n    color = \"yellow\"\n    shape = \"bent\"\n",
+ "unwrapped": "{\"fruit\": {\"blah\": [{\"name\": \"apple\", \"physical\": {\"color\": \"red\", \"shape\": \"round\"}}, {\"name\": \"banana\", \"physical\": {\"color\": \"yellow\", \"shape\": \"bent\"}}]}}"
+}

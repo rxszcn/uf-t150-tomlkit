@@ -1,0 +1,3 @@
+{
+ "error": "InvalidControlChar: Control characters (codes less than 0x1f and 0x7f) are not allowed in comments, use \\u0001 instead at line 1 col 12"
+}

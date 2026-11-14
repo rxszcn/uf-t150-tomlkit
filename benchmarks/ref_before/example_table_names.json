@@ -1,0 +1,4 @@
+{
+ "dumps": "['Special \"table\"']\nfoo = \"bar\"\n\n[\"BJ's Restaurant\"]\naccount = \"dining\"\n\n[\"]\"]\nfoo = 1\n\n[  \"[bracket]\"  ]\nbar = 2\n\n[  a . \"b.c\" . d  ]\nbaz = 3\n",
+ "unwrapped": "{\"BJ's Restaurant\": {\"account\": \"dining\"}, \"Special \\\"table\\\"\": {\"foo\": \"bar\"}, \"[bracket]\": {\"bar\": 2}, \"]\": {\"foo\": 1}, \"a\": {\"b.c\": {\"d\": {\"baz\": 3}}}}"
+}

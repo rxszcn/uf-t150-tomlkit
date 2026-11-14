@@ -1,0 +1,4 @@
+{
+ "dumps": "[[fruit]]\nname = 'apple'\n[fruit.physical]\ncolor = 'red'\n[[fruit.variety]]\nname = 'gala'\n[[fruit.variety]]\nname = 'fuji'\n[[fruit]]\nname = 'banana'\n",
+ "unwrapped": "{\"fruit\": [{\"name\": \"apple\", \"physical\": {\"color\": \"red\"}, \"variety\": [{\"name\": \"gala\"}, {\"name\": \"fuji\"}]}, {\"name\": \"banana\"}]}"
+}

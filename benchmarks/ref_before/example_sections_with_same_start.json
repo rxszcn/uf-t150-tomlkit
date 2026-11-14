@@ -1,0 +1,4 @@
+{
+ "dumps": "[section]\nkey = \"value\"\n\n[section2]\n\"key2\" = 12.34\n\n  [section2.sub-section]\n  \"key3\" = \"something\"\n",
+ "unwrapped": "{\"section\": {\"key\": \"value\"}, \"section2\": {\"key2\": 12.34, \"sub-section\": {\"key3\": \"something\"}}}"
+}

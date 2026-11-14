@@ -1,0 +1,4 @@
+{
+ "dumps": "this = \"this\\\\nthat\\\\nmore\"\nfoo = \"\"\"bar\nbaz\nqux\n\"\"\"\n",
+ "unwrapped": "{\"foo\": \"bar\\nbaz\\nqux\\n\", \"this\": \"this\\\\nthat\\\\nmore\"}"
+}

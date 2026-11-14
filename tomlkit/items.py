@@ -519,8 +519,13 @@ class SingleKey(Key):
         return hash(self.key)
 
     def __eq__(self, other: Any) -> bool:
+        # Check SingleKey first with a plain (non-ABC) isinstance: key
+        # comparisons dominate dict lookups during parsing, and routing every
+        # one of them through ABCMeta.__instancecheck__ is measurably slower.
+        if isinstance(other, SingleKey):
+            return self.key == other.key
         if isinstance(other, Key):
-            return isinstance(other, SingleKey) and self.key == other.key
+            return False
 
         return bool(self.key == other)
 
@@ -2022,8 +2027,11 @@ class Table(AbstractTable):
         self._value.append(key, _item)
 
         if isinstance(key, Key):
-            key = next(iter(key)).key
-            _item = self._value[key]
+            # Look the stored item back up with the SingleKey we already have
+            # instead of a bare str, so Container.item() doesn't rebuild one.
+            single = next(iter(key))
+            key = single.key
+            _item = self._value[single]
 
         if key is not None:
             dict.__setitem__(self, key, _item)
@@ -2050,11 +2058,39 @@ class Table(AbstractTable):
         if not isinstance(_item, Item):
             _item = item(_item)
 
+        if (
+            isinstance(key, Key)
+            and not key.is_multi()
+            and self._value._parsed
+            and key not in self._value._map
+        ):
+            # Fast path: a fresh, non-dotted key appended to a parsed
+            # container. Container.append reduces to the AoT/Table name
+            # assignment plus _raw_append in this case (trivia fixups and the
+            # not-parsed insertion logic are all gated on ``not _parsed``,
+            # and there is no existing key to merge with), and the stored
+            # item is known to be ``_item`` itself, so the post-append lookup
+            # is skipped as well (the dict entry still unwraps booleans,
+            # mirroring Container.__getitem__).
+            if isinstance(_item, (AoT, Table)) and _item.name is None:
+                _item.name = key.key
+            self._value._raw_append(key, _item)
+            dict.__setitem__(
+                self,
+                key.key,
+                _item.value if _item.is_boolean() else _item,
+            )
+
+            return self
+
         self._value.append(key, _item, validate=False)
 
         if isinstance(key, Key):
-            key = next(iter(key)).key
-            _item = self._value[key]
+            # Look the stored item back up with the SingleKey we already have
+            # instead of a bare str, so Container.item() doesn't rebuild one.
+            single = next(iter(key))
+            key = single.key
+            _item = self._value[single]
 
         if key is not None:
             dict.__setitem__(self, key, _item)

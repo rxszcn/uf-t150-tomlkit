@@ -1,0 +1,4 @@
+{
+ "dumps": "[s]\na = 'literal'\nb = \"esc \\t \\u0041 \\U0001F600 \\x41\"\nc = '''multi\nliteral'''\nd = \"\"\"multi\nbasic \\n\"\"\"\ne = \"backslash \\\" quote\"\n",
+ "unwrapped": "{\"s\": {\"a\": \"literal\", \"b\": \"esc \\t A \\ud83d\\ude00 A\", \"c\": \"multi\\nliteral\", \"d\": \"multi\\nbasic \\n\", \"e\": \"backslash \\\" quote\"}}"
+}

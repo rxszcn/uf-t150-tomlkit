@@ -1,0 +1,4 @@
+{
+ "dumps": "[a]\r\nk = 1  # comment\r\n[b.c]\r\nq = 2\r\n",
+ "unwrapped": "{\"a\": {\"k\": 1}, \"b\": {\"c\": {\"q\": 2}}}"
+}

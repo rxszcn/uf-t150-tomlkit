@@ -1,0 +1,4 @@
+{
+ "dumps": "no_whitespace = \"\"\"hello \\\n    world\"\"\"\n\nhas_whitespace = \"\"\"hello \\\n    world\"\"\"\n",
+ "unwrapped": "{\"has_whitespace\": \"hello world\", \"no_whitespace\": \"hello world\"}"
+}

@@ -314,23 +314,31 @@ class Container(_CustomDict):  # type: ignore[type-arg]
             assert isinstance(key, Key)
             item.name = key.key
 
-        prev = self._previous_item()
-        prev_ws = isinstance(prev, Whitespace) or ends_with_whitespace(prev)
-        if isinstance(item, Table):
-            if not self._parsed:
+        # NOTE: the trivia fixups below all require ``not self._parsed`` and
+        # need the previous item / whitespace lookup. Gate everything on
+        # ``not self._parsed`` first so the parse-time append path (the hot
+        # loop when loading a document) doesn't scan the body or run any
+        # isinstance checks on every single append.
+        if not self._parsed:
+            if isinstance(item, Table):
                 item.invalidate_display_name()
-            if (
-                self._body
-                and not (self._parsed or item.trivia.indent or prev_ws)
-                and key is not None
-                and not key.is_dotted()
-            ):
-                item.trivia.indent = "\n"
+                if (
+                    self._body
+                    and not item.trivia.indent
+                    and key is not None
+                    and not key.is_dotted()
+                    and not self._previous_item_is_whitespace()
+                ):
+                    item.trivia.indent = "\n"
 
-        if isinstance(item, AoT) and self._body and not self._parsed:
-            item.invalidate_display_name()
-            if item and not ("\n" in item[0].trivia.indent or prev_ws):
-                item[0].trivia.indent = "\n" + item[0].trivia.indent
+            if isinstance(item, AoT) and self._body:
+                item.invalidate_display_name()
+                if (
+                    item
+                    and "\n" not in item[0].trivia.indent
+                    and not self._previous_item_is_whitespace()
+                ):
+                    item[0].trivia.indent = "\n" + item[0].trivia.indent
 
         if key is not None and key in self:
             current_idx = self._map[key]
@@ -447,12 +455,11 @@ class Container(_CustomDict):  # type: ignore[type-arg]
             else:
                 raise KeyAlreadyPresent(key)
 
-        is_table = isinstance(item, (Table, AoT))
         if (
             key is not None
             and self._body
             and not self._parsed
-            and (not is_table or key.is_dotted())
+            and (not isinstance(item, (Table, AoT)) or key.is_dotted())
         ):
             # If there is already at least one table in the current container
             # and the given item is not a table, we need to find the last
@@ -490,6 +497,11 @@ class Container(_CustomDict):  # type: ignore[type-arg]
         if validate and key is not None:
             self._validate_out_of_order_table(key)
         return self
+
+    def _previous_item_is_whitespace(self) -> bool:
+        """Whether the last non-Null item is (or ends with) whitespace."""
+        prev = self._previous_item()
+        return isinstance(prev, Whitespace) or ends_with_whitespace(prev)
 
     def _validate_table_candidate(self, current: Table, candidate: Table) -> None:
         for k, v in candidate.value.body:

@@ -1,0 +1,4 @@
+{
+ "dumps": "# leading comment\ntop = 1\n[ a . b ]   # spaced header\nk = \"v\"\n[a.b.c.d]\ndeep = true\n[[aot]]\nx = 1\n[[aot]]\nx = 2\n[aot.sub]\ny = 3\n[[aot]]\nx = 3\n[tables.dw.t1]  # c1\nd = 1979-05-27T07:32:00Z\n[tables.dw.t2]\narr = [1, 2, 3]\ninline = {a = 1, b = \"x\"}\ndotted.key.here = 5\n[tables.dw.t2.more]\ns = \"\"\"multi\nline\"\"\"\n",
+ "unwrapped": "{\"a\": {\"b\": {\"c\": {\"d\": {\"deep\": true}}, \"k\": \"v\"}}, \"aot\": [{\"x\": 1}, {\"sub\": {\"y\": 3}, \"x\": 2}, {\"x\": 3}], \"tables\": {\"dw\": {\"t1\": {\"d\": \"1979-05-27 07:32:00+00:00\"}, \"t2\": {\"arr\": [1, 2, 3], \"dotted\": {\"key\": {\"here\": 5}}, \"inline\": {\"a\": 1, \"b\": \"x\"}, \"more\": {\"s\": \"multi\\nline\"}}}}, \"top\": 1}"
+}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import gc
 import re
 import string
 
@@ -32,6 +33,7 @@ from tomlkit.items import BoolType
 from tomlkit.items import Comment
 from tomlkit.items import Date
 from tomlkit.items import DateTime
+from tomlkit.items import DottedKey
 from tomlkit.items import Float
 from tomlkit.items import InlineTable
 from tomlkit.items import Integer
@@ -89,6 +91,17 @@ _CTRL_MULTI = frozenset(
 _MULTI_LITERAL_STOP = _CTRL_MULTI | {"'", "\r"}  # literal: closing quote or CR
 _MULTI_BASIC_STOP = _CTRL_MULTI | {'"', "\\", "\r"}  # basic: quote, escape or CR
 
+# Stop-set for the comment-body bulk scan: a comment runs to the next newline
+# (CR or LF); DEL and control chars other than tab raise InvalidControlChar.
+_COMMENT_STOP = _CTRL_SINGLE | _NL
+
+# Value-dispatch characters, cached at module level so the per-value dispatch
+# doesn't pay an enum ``.value`` attribute lookup on every comparison.
+_CHAR_SLB = StringType.SLB.value  # '"'
+_CHAR_SLL = StringType.SLL.value  # "'"
+_CHAR_TRUE = BoolType.TRUE.value[0]  # 't'
+_CHAR_FALSE = BoolType.FALSE.value[0]  # 'f'
+
 
 class Parser:
     """
@@ -106,6 +119,11 @@ class Parser:
 
         self._aot_stack: list[Key] = []
         self._nesting_depth = 0
+        # Key parsed by the most recent _peek_table() call, as
+        # (bracket index, end index, is_aot, key). Every table header is
+        # peeked right before it is parsed, so _parse_table() reuses this
+        # instead of parsing the same header key twice.
+        self._peeked: tuple[int, int, bool, Key] | None = None
 
     @property
     def _state(self) -> _StateHandler:
@@ -173,6 +191,22 @@ class Parser:
         return self._src.parse_error(exception, *args, **kwargs)
 
     def parse(self) -> TOMLDocument:
+        # Parsing allocates huge numbers of short-lived objects (one per key,
+        # value, trivia...). CPython's cyclic GC repeatedly scans them even
+        # though the parser's garbage is almost entirely acyclic and is
+        # reclaimed by reference counting alone; on large documents the
+        # collections dominate the parse time. Pause cyclic collection for
+        # the duration of the parse and restore it afterwards.
+        gc_was_enabled = gc.isenabled()
+        if gc_was_enabled:
+            gc.disable()
+        try:
+            return self._parse()
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+
+    def _parse(self) -> TOMLDocument:
         body = TOMLDocument(True)
 
         # Take all keyvals outside of tables/AoT's.
@@ -204,13 +238,75 @@ class Parser:
                 value = self._parse_aot(value, key)
 
             try:
-                body.append(key, value)
+                self._append_table(body, key, value)
             except Exception as e:
                 raise self.parse_error(ParseError, str(e)) from e
 
         body.parsing(False)
 
         return body
+
+    def _append_table(
+        self, body: Container, key: Key | None, value: Table | AoT
+    ) -> None:
+        """Append a parsed table to the document body.
+
+        Fast path for the common catalog shape where many ``[a.b.c]`` headers
+        share the same super-table prefix: rather than merging the throwaway
+        super-table chain into the document through the generic
+        ``Container.append`` at every level, navigate the already-merged
+        super tables and append only the leaf. This is done exactly when the
+        generic append would perform the in-place super-table merge at every
+        level of the chain (existing super table under the same, non-dotted
+        key, last table key unchanged, no out-of-order fragments); the
+        intermediate merge steps have no observable side effects, so skipping
+        them is behavior-preserving. Anything else falls back to the generic
+        append.
+        """
+        if (
+            key is None
+            or key.is_dotted()
+            or not isinstance(value, Table)
+            or not value.is_super_table()
+        ):
+            body.append(key, value)
+            return
+
+        container = body
+        parent_table: Table | None = None
+        k: Key | None = key
+        v: Table | AoT = value
+        while (
+            isinstance(v, Table)
+            and v.is_super_table()
+            and k is not None
+            and not k.is_dotted()
+            and len(v.value.body) == 1
+            and container._table_keys
+            and k in container._map
+        ):
+            idx = container._map[k]
+            if not isinstance(idx, int):
+                # out-of-order fragments: the generic append handles them
+                break
+            cur_key, cur_item = container._body[idx]
+            if not (isinstance(cur_item, Table) and cur_item.is_super_table()):
+                break
+            if cur_key is None or cur_key.is_dotted():
+                break
+            if container._table_keys[-1] != cur_key:
+                break
+            child_k, child_v = v.value.body[0]
+            if child_k is None:
+                break
+            container = cur_item.value
+            parent_table = cur_item
+            k, v = child_k, child_v
+
+        if parent_table is None:
+            body.append(key, value)
+        else:
+            parent_table.append(k, v)
 
     def _merge_ws(self, item: Item, container: Container) -> bool:
         """
@@ -239,8 +335,8 @@ class Parser:
         Returns whether a key is strictly a child of another key.
         AoT siblings are not considered children of one another.
         """
-        parent_parts = tuple(parent)
-        child_parts = tuple(child)
+        parent_parts = parent._keys
+        child_parts = child._keys
 
         if parent_parts == child_parts:
             return False
@@ -252,15 +348,23 @@ class Parser:
         Attempts to parse the next item and returns it, along with its key
         if the item is value-like.
         """
-        self.mark()
-        with self._state as state:
+        # PERF: inline the ``with self._state as state`` block -- save the
+        # index by hand and restore it only when a KV pair is found (or an
+        # error propagates), avoiding a _State allocation and a
+        # context-manager round trip per item.
+        src = self._src
+        src._marker = src._idx
+        saved_idx = src._idx
+        saved_current = src._current
+        restore = False
+        try:
             while True:
-                c = self._current
+                c = src._current
                 if c == "\n":
                     # Found a newline; Return all whitespace found up to this point.
                     self.inc()
 
-                    return None, Whitespace(self.extract())
+                    return None, Whitespace(src[src._marker : src._idx])
                 elif c in " \t\r":
                     if c == "\r":
                         with self._state(restore=True):
@@ -270,10 +374,10 @@ class Parser:
                                 )
                     # Skip whitespace.
                     if not self.inc():
-                        return None, Whitespace(self.extract())
+                        return None, Whitespace(src[src._marker : src._idx])
                 elif c == "#":
                     # Found a comment, parse it
-                    indent = self.extract()
+                    indent = src[src._marker : src._idx]
                     cws, comment, trail = self._parse_comment_trail()
 
                     return None, Comment(Trivia(indent, cws, comment, trail))
@@ -284,8 +388,15 @@ class Parser:
                     # Beginning of a KV pair.
                     # Return to beginning of whitespace so it gets included
                     # as indentation for the KV about to be parsed.
-                    state.restore = True
+                    restore = True
                     break
+        except BaseException:
+            src._idx = saved_idx
+            src._current = saved_current
+            raise
+        if restore:
+            src._idx = saved_idx
+            src._current = saved_current
 
         return self._parse_key_value(True)
 
@@ -300,39 +411,44 @@ class Parser:
 
         comment = ""
         comment_ws = ""
-        self.mark()
+        src = self._src
+        src._marker = src._idx
 
         while True:
-            c = self._current
+            # Skip whitespace before the comment in one bulk scan (guarded:
+            # most positions have no leading whitespace at all).
+            if src._current in _SPACES:
+                src.advance_while(_SPACES)
+            if self.end():
+                break
+            c = src._current
 
             if c == "\n":
                 break
             elif c == "#":
-                comment_ws = self.extract()
+                comment_ws = src[src._marker : src._idx]
 
-                self.mark()
+                src._marker = src._idx
                 self.inc()  # Skip #
 
-                # The comment itself
-                while not self.end() and self._current not in _NL:
-                    code = ord(self._current)
-                    if code == CHR_DEL or (code <= CTRL_CHAR_LIMIT and code != CTRL_I):
-                        raise self.parse_error(InvalidControlChar, code, "comments")
+                # The comment itself: bulk-scan up to the next newline or a
+                # control character (invalid in comments) in a single slice.
+                src.advance_until(_COMMENT_STOP)
+                if not self.end() and src._current not in _NL:
+                    raise self.parse_error(
+                        InvalidControlChar, ord(src._current), "comments"
+                    )
 
-                    if not self.inc():
-                        break
-
-                comment = self.extract()
-                self.mark()
+                comment = src[src._marker : src._idx]
+                src._marker = src._idx
 
                 break
-            elif c in " \t\r":
-                if c == "\r":
-                    with self._state(restore=True):
-                        if not self.inc() or self._current != "\n":
-                            raise self.parse_error(
-                                InvalidControlChar, CTRL_M, "comments"
-                            )
+            elif c == "\r":
+                with self._state(restore=True):
+                    if not self.inc() or self._current != "\n":
+                        raise self.parse_error(
+                            InvalidControlChar, CTRL_M, "comments"
+                        )
                 self.inc()
             else:
                 raise self.parse_error(UnexpectedCharError, c)
@@ -342,49 +458,57 @@ class Parser:
 
         trail = ""
         if parse_trail:
-            self._src.advance_while(_SPACES)
+            if src._current in _SPACES:
+                src.advance_while(_SPACES)
 
-            if self._current == "\r":
+            if src._current == "\r":
                 with self._state(restore=True):
                     if not self.inc() or self._current != "\n":
                         raise self.parse_error(InvalidControlChar, CTRL_M, "documents")
                 self.inc()
 
-            if self._current == "\n":
+            if src._current == "\n":
                 self.inc()
 
-            if self._idx != self._marker or self._current in _WS:
-                trail = self.extract()
+            if src._idx != src._marker or src._current in _WS:
+                trail = src[src._marker : src._idx]
 
         return comment_ws, comment, trail
 
     def _parse_key_value(self, parse_comment: bool = False) -> tuple[Key, Item]:
         # Leading indent
-        self.mark()
+        src = self._src
+        src._marker = src._idx
 
-        self._src.advance_while(_SPACES)
+        if src._current in _SPACES:
+            src.advance_while(_SPACES)
 
         indent = self.extract()
 
         # Key
         key = self._parse_key()
 
-        self.mark()
+        src._marker = src._idx
 
-        found_equals = self._current == "="
-        while self._current in _KV and self.inc():
-            if self._current == "=":
-                if found_equals:
-                    raise self.parse_error(UnexpectedCharError, "=")
-                else:
-                    found_equals = True
+        # Skip whitespace around the "=", requiring exactly one. Bulk-scan the
+        # space runs instead of consuming one character per loop iteration.
+        found_equals = False
+        while True:
+            if src._current in _SPACES:
+                src.advance_while(_SPACES)
+            if src._current != "=":
+                break
+            if found_equals:
+                raise self.parse_error(UnexpectedCharError, "=")
+            found_equals = True
+            self.inc()
         if not found_equals:
             raise self.parse_error(UnexpectedCharError, self._current)
 
         if not key.sep:
-            key.sep = self.extract()
+            key.sep = src[src._marker : src._idx]
         else:
-            key.sep += self.extract()
+            key.sep += src[src._marker : src._idx]
 
         # Value
         val = self._parse_value()
@@ -410,8 +534,17 @@ class Parser:
         WS before the key must be exhausted first at the callsite.
         """
         key = self._parse_simple_key()
+        src = self._src
+        if src._current != ".":
+            return key
+
+        # Dotted key: collect every fragment first and build a single
+        # DottedKey at the end, instead of concatenating intermediate
+        # DottedKeys -- each concat copied the fragment list and rebuilt the
+        # joined "original" representation.
         fragments = 1
-        while self._current == ".":
+        keys = list(key._keys)
+        while src._current == ".":
             fragments += 1
             if fragments > self.MAX_NESTING_DEPTH:
                 raise self.parse_error(
@@ -419,18 +552,21 @@ class Parser:
                     f"TOML key nested more than {self.MAX_NESTING_DEPTH} levels deep",
                 )
             self.inc()
-            key = key.concat(self._parse_simple_key())
+            keys.extend(self._parse_simple_key()._keys)
 
-        return key
+        return DottedKey(keys, sep=key.sep)
 
     def _parse_simple_key(self) -> Key:
         """
         Parses a single (non-dotted) key fragment.
         """
-        self.mark()
-        # Skip any leading whitespace (bulk scan)
-        self._src.advance_while(_SPACES)
-        if self._current in "\"'":
+        src = self._src
+        src._marker = src._idx
+        # Skip any leading whitespace (bulk scan, guarded: most key fragments
+        # have no leading whitespace at all)
+        if src._current in _SPACES:
+            src.advance_while(_SPACES)
+        if src._current in "\"'":
             return self._parse_quoted_key()
         else:
             return self._parse_bare_key()
@@ -485,26 +621,30 @@ class Parser:
         c = self._current
         trivia = Trivia()
 
-        if c == StringType.SLB.value:
+        if c == _CHAR_SLB:
             return self._parse_basic_string()
-        elif c == StringType.SLL.value:
+        elif c == _CHAR_SLL:
             return self._parse_literal_string()
-        elif c == BoolType.TRUE.value[0]:
+        elif c == _CHAR_TRUE:
             return self._parse_true()
-        elif c == BoolType.FALSE.value[0]:
+        elif c == _CHAR_FALSE:
             return self._parse_false()
         elif c == "[":
             return self._parse_nested(self._parse_array)
         elif c == "{":
             return self._parse_nested(self._parse_inline_table)
-        elif c in "+-" or self._peek(4) in {
-            "+inf",
-            "-inf",
-            "inf",
-            "+nan",
-            "-nan",
-            "nan",
-        }:
+        elif c in "+-" or (
+            c in "in"
+            and self._peek(4)
+            in {
+                "+inf",
+                "-inf",
+                "inf",
+                "+nan",
+                "-nan",
+                "nan",
+            }
+        ):
             # Number
             self._src.advance_until(_NUM_STOP)
 
@@ -607,6 +747,24 @@ class Parser:
     def _parse_bool(self, style: BoolType) -> Bool:
         with self._state:
             style = BoolType(style)
+
+            # Fast path: the input at the current position starts with the
+            # literal ("true"/"false") -- consume it in one slice instead of
+            # a char-by-char consume() loop. Anything else falls back to the
+            # original loop so the UnexpectedCharError position is unchanged.
+            src = self._src
+            word = style.value
+            idx = src._idx
+            if src.startswith(word, idx):
+                idx += len(word)
+                if idx < len(src):
+                    src._idx = idx
+                    src._current = src[idx]
+                else:
+                    src._idx = len(src)
+                    src._current = src.EOF
+
+                return Bool(style, Trivia())
 
             # only keep parsing for bool if the characters match the style
             # try consuming rest of chars in style
@@ -805,12 +963,30 @@ class Parser:
         return None
 
     def _parse_literal_string(self) -> String:
-        with self._state:
+        # Inline ``with self._state``: the state only restores on exception,
+        # so a plain try/except avoids a _State allocation and a
+        # context-manager round trip per string.
+        src = self._src
+        saved_idx = src._idx
+        saved_current = src._current
+        try:
             return self._parse_string(StringType.SLL)
+        except BaseException:
+            src._idx = saved_idx
+            src._current = saved_current
+            raise
 
     def _parse_basic_string(self) -> String:
-        with self._state:
+        # See _parse_literal_string for why this isn't ``with self._state``.
+        src = self._src
+        saved_idx = src._idx
+        saved_current = src._current
+        try:
             return self._parse_string(StringType.SLB)
+        except BaseException:
+            src._idx = saved_idx
+            src._current = saved_current
+            raise
 
     def _parse_escaped_char(self, multiline: bool) -> str:
         if multiline and self._current in _WS:
@@ -913,20 +1089,25 @@ class Parser:
         # char (and, for multiline, CR); that stop char is then handled by the
         # branches above on the next iteration.
         src = self._src
-        if delim.is_singleline():
-            body_stop = _SINGLE_BASIC_STOP if delim.is_basic() else _SINGLE_LITERAL_STOP
+        singleline = delim.is_singleline()
+        multiline = delim.is_multiline()
+        basic = delim.is_basic()
+        unit = delim.unit
+        if singleline:
+            body_stop = _SINGLE_BASIC_STOP if basic else _SINGLE_LITERAL_STOP
         else:
-            body_stop = _MULTI_BASIC_STOP if delim.is_basic() else _MULTI_LITERAL_STOP
+            body_stop = _MULTI_BASIC_STOP if basic else _MULTI_LITERAL_STOP
 
         escaped = False  # whether the previous key was ESCAPE
         while True:
-            code = ord(self._current)
+            cur = src._current
+            code = ord(cur)
             if (
-                delim.is_singleline()
+                singleline
                 and not escaped
                 and (code == CHR_DEL or (code <= CTRL_CHAR_LIMIT and code != CTRL_I))
             ) or (
-                delim.is_multiline()
+                multiline
                 and not escaped
                 and (
                     code == CHR_DEL
@@ -936,21 +1117,21 @@ class Parser:
                 )
             ):
                 raise self.parse_error(InvalidControlChar, code, "strings")
-            elif delim.is_multiline() and not escaped and self._current == "\r":
+            elif multiline and not escaped and cur == "\r":
                 with self._state(restore=True):
                     if not self.inc() or self._current != "\n":
                         raise self.parse_error(InvalidControlChar, CTRL_M, "strings")
                 value += self._current
                 self.inc(exception=UnexpectedEofError)
-            elif not escaped and self._current == delim.unit:
+            elif not escaped and cur == unit:
                 # try to process current as a closing delim
                 original = self.extract()
 
                 close = ""
-                if delim.is_multiline():
+                if multiline:
                     # Consume the delimiters to see if we are at the end of the string
                     close = ""
-                    while self._current == delim.unit:
+                    while self._current == unit:
                         close += self._current
                         self.inc()
 
@@ -977,14 +1158,14 @@ class Parser:
                     self.inc()
 
                 return String(delim, value, original, Trivia())
-            elif delim.is_basic() and escaped:
+            elif basic and escaped:
                 # attempt to parse the current char as an escaped value, an exception
                 # is raised if this fails
-                value += self._parse_escaped_char(delim.is_multiline())
+                value += self._parse_escaped_char(multiline)
 
                 # no longer escaped
                 escaped = False
-            elif delim.is_basic() and self._current == "\\":
+            elif basic and cur == "\\":
                 # the next char is being escaped
                 escaped = True
 
@@ -1019,21 +1200,34 @@ class Parser:
             )
 
         indent = self.extract()
-        self.inc()  # Skip opening bracket
 
-        if self.end():
-            raise self.parse_error(UnexpectedEofError)
+        # Reuse the key parsed by the immediately preceding _peek_table() call
+        # when it was taken at this very bracket: every table header is peeked
+        # (to decide nesting) right before it is parsed, so parsing the key
+        # again here would duplicate the work.
+        peeked = self._peeked
+        self._peeked = None
+        if peeked is not None and peeked[0] == self._idx:
+            _, end_idx, is_aot, key = peeked
+            src = self._src
+            src._idx = end_idx
+            src._current = src[end_idx] if end_idx < len(src) else Source.EOF
+        else:
+            self.inc()  # Skip opening bracket
 
-        is_aot = False
-        if self._current == "[":
-            if not self.inc():
+            if self.end():
                 raise self.parse_error(UnexpectedEofError)
 
-            is_aot = True
-        try:
-            key = self._parse_key()
-        except EmptyKeyError:
-            raise self.parse_error(EmptyTableNameError) from None
+            is_aot = False
+            if self._current == "[":
+                if not self.inc():
+                    raise self.parse_error(UnexpectedEofError)
+
+                is_aot = True
+            try:
+                key = self._parse_key()
+            except EmptyKeyError:
+                raise self.parse_error(EmptyTableNameError) from None
         if self.end():
             raise self.parse_error(UnexpectedEofError)
         elif self._current != "]":
@@ -1041,15 +1235,19 @@ class Parser:
 
         key.sep = ""
         full_key = key
-        name_parts = tuple(key)
-        if any(" " in part.key.strip() and part.is_bare() for part in name_parts):
+        full_key_str = full_key.as_string()
+        name_parts = key._keys
+        # NOTE: ``part.key`` needs no strip() here -- bare keys are already
+        # validated space-free by _parse_bare_key, and for quoted keys the
+        # is_bare() short-circuit makes the whitespace test irrelevant.
+        if any(part.is_bare() and " " in part.key for part in name_parts):
             raise self.parse_error(
-                ParseError, f'Invalid table name "{full_key.as_string()}"'
+                ParseError, f'Invalid table name "{full_key_str}"'
             )
 
         missing_table = False
         if parent_name:
-            parent_name_parts = tuple(parent_name)
+            parent_name_parts = parent_name._keys
         else:
             parent_name_parts = ()
 
@@ -1077,7 +1275,7 @@ class Parser:
             Trivia(indent, cws, comment, trail),
             is_aot,
             name=name_parts[0].key if name_parts else key.key,
-            display_name=full_key.as_string(),
+            display_name=full_key_str,
             is_super_table=False,
         )
 
@@ -1100,17 +1298,19 @@ class Parser:
             key = name_parts[0]
 
             for i, _name in enumerate(name_parts[1:]):
-                child = table.get(
-                    _name,
-                    Table(
-                        Container(True),
-                        Trivia(indent, cws, comment, trail),
-                        is_aot and i == len(name_parts) - 2,
-                        is_super_table=i < len(name_parts) - 2,
-                        name=_name.key,
-                        display_name=(
-                            full_key.as_string() if i == len(name_parts) - 2 else None
-                        ),
+                # ``table`` is always a freshly created table with an empty
+                # container here (either the missing super table above or the
+                # leaf created before the loop), so the child is built
+                # directly instead of via table.get(_name, default) -- the
+                # get always missed and paid a KeyError round trip per level.
+                child = Table(
+                    Container(True),
+                    Trivia(indent, cws, comment, trail),
+                    is_aot and i == len(name_parts) - 2,
+                    is_super_table=i < len(name_parts) - 2,
+                    name=_name.key,
+                    display_name=(
+                        full_key_str if i == len(name_parts) - 2 else None
                     ),
                 )
 
@@ -1168,20 +1368,27 @@ class Parser:
 
     def _peek_table(self) -> tuple[bool, Key]:
         """
-        Peeks ahead non-intrusively by cloning then restoring the
+        Peeks ahead non-intrusively by saving then restoring the
         initial state of the parser.
 
         Returns the name of the table about to be parsed,
         as well as whether it is part of an AoT.
         """
-        # we always want to restore after exiting this scope
-        with self._state(save_marker=True, restore=True):
+        src = self._src
+        # PERF: inline ``with self._state(save_marker=True, restore=True)`` and
+        # remember the parsed key so the _parse_table() call that immediately
+        # follows can reuse it instead of parsing the same header key twice.
+        saved_idx = src._idx
+        saved_current = src._current
+        saved_marker = src._marker
+        try:
             if self._current != "[":
                 raise self.parse_error(
                     InternalParserError,
                     "_peek_table() entered on non-bracket character",
                 )
 
+            bracket_idx = src._idx
             # AoT
             self.inc()
             is_aot = False
@@ -1189,9 +1396,15 @@ class Parser:
                 self.inc()
                 is_aot = True
             try:
-                return is_aot, self._parse_key()
+                key = self._parse_key()
             except EmptyKeyError:
                 raise self.parse_error(EmptyTableNameError) from None
+            self._peeked = (bracket_idx, src._idx, is_aot, key)
+            return is_aot, key
+        finally:
+            src._idx = saved_idx
+            src._current = saved_current
+            src._marker = saved_marker
 
     def _parse_aot(self, first: Table, name_first: Key) -> AoT:
         """
